@@ -2,13 +2,13 @@
 Instance segmentation evaluation for MAINet and MMDetection checkpoints.
 
 Real mixed checkpoints:
-  python eval.py --real-only --data mixed_point_streak_trainable --split test
-  python eval.py --all --data mixed_point_streak_trainable --split test
-  python eval.py --model work_dirs\real_mixed_baselines\mainet_v4 --data mixed_point_streak_trainable --split test
-  python eval.py --model work_dirs\real_mixed_baselines\mmdet\mask_rcnn --data mixed_point_streak_trainable --split test
-  python eval.py --model work_dirs\real_mixed_baselines\mmdet\condinst --data mixed_point_streak_trainable --split test
+  python eval.py --real-only --data output_mix --split test
+  python eval.py --all --data output_mix --split test
+  python eval.py --model work_dirs\real_mixed_baselines\mainet_v4 --data output_mix --split test
+  python eval.py --model work_dirs\real_mixed_baselines\mmdet\mask_rcnn --data output_mix --split test
+  python eval.py --model work_dirs\real_mixed_baselines\mmdet\condinst --data output_mix --split test
   python eval.py --model work_dirs\real_mixed_baselines\mmdet\mask2former --data output_mix --split test
-  python eval.py --model work_dirs\real_mixed_baselines\yolo --data mixed_point_streak_trainable --split test --force
+  python eval.py --model work_dirs\real_mixed_baselines\yolo --data output_mix --split test --force
 
 Moved dataset example:
   python eval.py --all --data E:\codes\query_mask\output_mix --split test
@@ -18,6 +18,8 @@ Notes:
   - Use the mmdet environment for MMDetection checkpoints.
   - AP/IoU and F1 use raw masks; cMSE/B-MSE use the largest 8-connected prediction component.
   - F1 uses score >= --score_thr and one-to-one mask matching at IoU >= 0.50.
+  - SNR is recomputed from the model-input image and GT masks using local peak contrast / MAD noise.
+  - SNR groups are [0,3), [3,4), [4,5), and [5,+inf).
   - Results are saved to work_dirs/comparison_results.json.
 """
 import os, sys, json, argparse, hashlib
@@ -75,8 +77,17 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 AP_IOU_THRESHOLDS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.90]
 F1_IOU_THRESHOLD = 0.50
+SNR_BINS = (
+    ('0-3', 0.0, 3.0),
+    ('3-4', 3.0, 4.0),
+    ('4-5', 4.0, 5.0),
+    ('>=5', 5.0, float('inf')),
+)
+SNR_LOCAL_PADDING = 12
+SNR_MIN_BACKGROUND_PIXELS = 30
+SNR_DEFINITION = 'input_local_peak_over_mad_v1'
 PREPROCESSED = {'real_asinh_0_1', 'real_zscale_0_1', 'fits_zscale_0_1', 'bmp_asinh_0_1'}
-EVAL_SCHEMA_VERSION = 5
+EVAL_SCHEMA_VERSION = 14
 
 
 CONNECTIVITY_8 = np.ones((3, 3), dtype=np.uint8)
@@ -161,6 +172,66 @@ def _model_input_image(img, img_info):
         img = np.where(np.isfinite(img), img, 0.0)
         return np.clip(img, 0.0, 1.0).astype(np.float32)
     return _normalize_astro(img)
+
+
+def compute_input_contrast_snr(image, gt_masks,
+                               padding=SNR_LOCAL_PADDING,
+                               min_background_pixels=SNR_MIN_BACKGROUND_PIXELS):
+    """Compute per-instance peak SNR from the actual model-input image.
+
+    For every GT mask, local background pixels are taken from an expanded
+    bounding box while excluding all GT masks. Background level is the local
+    median and noise is ``1.4826 * MAD``. The returned quantity is therefore
+    an input-domain contrast SNR, not a physical aperture-photometry SNR.
+    """
+    image = np.asarray(image, dtype=np.float32)
+    gt_masks = np.asarray(gt_masks, dtype=bool)
+    if image.ndim != 2:
+        raise ValueError(f'SNR expects a 2-D image, got shape={image.shape}')
+    if gt_masks.ndim != 3 or gt_masks.shape[1:] != image.shape:
+        raise ValueError(
+            f'SNR mask/image shape mismatch: masks={gt_masks.shape}, image={image.shape}')
+    if len(gt_masks) == 0:
+        return []
+
+    finite = np.isfinite(image)
+    all_foreground = gt_masks.any(axis=0)
+    global_background = image[finite & ~all_foreground]
+    height, width = image.shape
+    values = []
+
+    for mask in gt_masks:
+        signal_keep = mask & finite
+        ys, xs = np.where(signal_keep)
+        if len(xs) == 0:
+            values.append(float('nan'))
+            continue
+
+        x0 = max(0, int(xs.min()) - padding)
+        x1 = min(width, int(xs.max()) + padding + 1)
+        y0 = max(0, int(ys.min()) - padding)
+        y1 = min(height, int(ys.max()) + padding + 1)
+        local_keep = finite[y0:y1, x0:x1] & ~all_foreground[y0:y1, x0:x1]
+        background = image[y0:y1, x0:x1][local_keep]
+        if background.size < min_background_pixels:
+            background = global_background
+        if background.size == 0:
+            values.append(float('nan'))
+            continue
+
+        background_level = float(np.median(background))
+        mad = float(np.median(np.abs(background - background_level)))
+        noise_std = 1.4826 * mad
+        if not np.isfinite(noise_std) or noise_std <= 1e-6:
+            noise_std = float(np.std(background))
+        if not np.isfinite(noise_std) or noise_std <= 1e-6:
+            values.append(float('nan'))
+            continue
+
+        peak_signal = float(np.max(image[signal_keep])) - background_level
+        values.append(max(0.0, peak_signal / noise_std))
+
+    return values
 
 
 def mask_centroid(mask):
@@ -415,6 +486,51 @@ def compute_coco_ap_for_gt_subset(iou_mats, pred_scores_list, gt_keep_list):
     return ap, ap_iou
 
 
+def match_all_gt(iou_mats, pred_scores_list, score_thr=0.3, iou_thr=0.5):
+    """Match exactly like overall cMSE: per-image Hungarian mask-IoU matching."""
+    matched_pred = [np.full(mat.shape[1], -1, dtype=np.int64) for mat in iou_mats]
+    for img_idx, (iou_mat, scores) in enumerate(zip(iou_mats, pred_scores_list)):
+        keep = np.where(np.asarray(scores) >= score_thr)[0]
+        if len(keep) == 0 or iou_mat.shape[1] == 0:
+            continue
+        filtered_iou = iou_mat[keep]
+        pred_indices, gt_indices = linear_sum_assignment(-filtered_iou)
+        for filtered_pred_idx, gt_idx in zip(pred_indices, gt_indices):
+            if filtered_iou[filtered_pred_idx, gt_idx] >= iou_thr:
+                matched_pred[img_idx][gt_idx] = int(keep[filtered_pred_idx])
+    return matched_pred
+
+
+def compute_snr_recall_metrics(iou_mats, pred_scores_list, gt_snr_list,
+                               score_thr=0.3):
+    """Compute GT-conditioned recall after one global match."""
+    snr_arrays = [np.asarray(values, dtype=np.float32)
+                  for values in gt_snr_list]
+    matched_pred = match_all_gt(
+        iou_mats, pred_scores_list,
+        score_thr=score_thr, iou_thr=F1_IOU_THRESHOLD)
+
+    metrics = {}
+    for label, lower, upper in SNR_BINS:
+        keep_list = [np.isfinite(values) & (values >= lower) & (values < upper)
+                     for values in snr_arrays]
+        count = sum(int(keep.sum()) for keep in keep_list)
+        tp = sum(int(((assignment >= 0) & keep).sum())
+                 for assignment, keep in zip(matched_pred, keep_list))
+        fn = count - tp
+        recall = tp / count if count > 0 else float('nan')
+
+        metrics[label] = {
+            'range': [lower, None if np.isinf(upper) else upper],
+            'count': count,
+            'tp': int(tp),
+            'fn': int(fn),
+            'recall': (round(recall, 4)
+                       if not np.isnan(recall) else float('nan')),
+        }
+    return metrics
+
+
 def subset_gt_by_keep(gt_masks_list, iou_mats, gt_keep_list):
     sub_masks, sub_iou = [], []
     for gts, mat, keep in zip(gt_masks_list, iou_mats, gt_keep_list):
@@ -431,7 +547,7 @@ def compute_centroid_mse(pred_masks_list, pred_scores_list, gt_masks_list,
     """Compute matched-TP centroid MSE from each prediction's main component.
 
     IoU matching still uses the complete raw masks.  Only the prediction
-    centroid is made robust to disconnected satellite pixels.  GT centroids
+    centroid is made robust to disconnected satellite pixels. GT centroids
     retain their original complete-mask definition.
     """
     total_mse = 0.0
@@ -562,10 +678,6 @@ def evaluate_model(model, model_type, data_root, split, device, score_thr=0.3, m
     with open(coco_json, encoding='utf-8-sig') as f:
         coco = json.load(f)
 
-    ann_by_img = {}
-    for ann in coco['annotations']:
-        ann_by_img.setdefault(ann['image_id'], []).append(ann)
-
     images = coco['images']
     if max_images > 0:
         images = images[:max_images]
@@ -592,8 +704,7 @@ def evaluate_model(model, model_type, data_root, split, device, score_thr=0.3, m
             img = _model_input_image(img, im)
             img_tensors.append(torch.from_numpy(img))
             gt_masks = np.load(f"{mask_dir}/{image_id:06d}_masks.npy").astype(bool)
-            anns = ann_by_img.get(image_id, [])
-            gt_snr = [float(a.get('snr', 0.0)) for a in anns]
+            gt_snr = compute_input_contrast_snr(img, gt_masks)
             gt_masks_all.append(gt_masks)
             gt_snr_all.append(gt_snr)
             gt_modes_all.append(str(im.get('mode', '')).lower())
@@ -687,8 +798,9 @@ def evaluate_model(model, model_type, data_root, split, device, score_thr=0.3, m
             pred_masks_all.append(pms)
             pred_scores_all.append(pss)
             gt_masks = np.load(f"{mask_dir}/{image_id:06d}_masks.npy").astype(bool)
-            anns = ann_by_img.get(image_id, [])
-            gt_snr = [float(a.get('snr', 0.0)) for a in anns]
+            snr_image = np.load(img_path).astype(np.float32)
+            snr_image = _model_input_image(snr_image, im)
+            gt_snr = compute_input_contrast_snr(snr_image, gt_masks)
             gt_masks_all.append(gt_masks)
             gt_snr_all.append(gt_snr)
             gt_modes_all.append(str(im.get('mode', '')).lower())
@@ -702,13 +814,21 @@ def evaluate_model(model, model_type, data_root, split, device, score_thr=0.3, m
                                  iou_mats=iou_mats)
     f1_metrics = compute_f1_from_iou_mats(
         iou_mats, pred_scores_all, score_thr=score_thr)
+    snr_metrics = compute_snr_recall_metrics(
+        iou_mats, pred_scores_all, gt_snr_all, score_thr=score_thr)
+    snr_missing = sum(int((~np.isfinite(np.asarray(values))).sum())
+                      for values in gt_snr_all)
     cmse, _ = compute_centroid_mse(
         pred_masks_all, pred_scores_all, gt_masks_all,
         iou_mats=iou_mats, score_thr=score_thr)
 
     #                         GT         
-    bright_keep = [np.asarray(snr, dtype=np.float32) >= 3.0 for snr in gt_snr_all]
-    faint_keep = [np.asarray(snr, dtype=np.float32) < 3.0 for snr in gt_snr_all]
+    bright_keep = [np.isfinite(np.asarray(snr, dtype=np.float32)) &
+                   (np.asarray(snr, dtype=np.float32) >= 3.0)
+                   for snr in gt_snr_all]
+    faint_keep = [np.isfinite(np.asarray(snr, dtype=np.float32)) &
+                  (np.asarray(snr, dtype=np.float32) < 3.0)
+                  for snr in gt_snr_all]
     binary_keep = [_binary_gt_keep(masks) for masks in gt_masks_all]
 
     bright_ap, bright_ap_iou = compute_coco_ap_for_gt_subset(
@@ -767,6 +887,12 @@ def evaluate_model(model, model_type, data_root, split, device, score_thr=0.3, m
         f1_fn=f1_metrics['fn'],
         f1_score_thr=float(score_thr),
         f1_iou_thr=F1_IOU_THRESHOLD,
+        snr_metrics=snr_metrics,
+        snr_missing=snr_missing,
+        snr_definition=SNR_DEFINITION,
+        snr_local_padding=SNR_LOCAL_PADDING,
+        snr_matching='hungarian_mask_iou_0.50',
+        centroid_mse_reference='gt_mask_centroid',
         cmse=round(cmse, 4) if not np.isnan(cmse) else float('nan'),
         bright_ap=round(bright_ap, 4) if not np.isnan(bright_ap) else float('nan'),
         bright_ap_iou=bright_ap_iou,
@@ -1139,19 +1265,27 @@ def print_table(results):
         print(f"{name:<16}{SEP}{_fmt7(m['ap'])}{iou_vals}"
               f"{SEP}{_fmt7(m.get('f1'))}{SEP}{_fmt7(m['cmse'])}")
 
-    #                 
-    print("\nSNR split:")
-    print("-" * (16 + 8 * 7))
-    print(f"{'Model':<16}{SEP}{'Brt-AP':>7}{SEP}{'Brt75':>7}{SEP}{'Brt90':>7}"
-          f"{SEP}{'Fnt-AP':>7}{SEP}{'Fnt75':>7}{SEP}{'Fnt90':>7}")
-    print("-" * (16 + 8 * 7))
-    for name, m in results.items():
-        bright_iou = _get_ap_iou(m, 'bright_')
-        faint_iou = _get_ap_iou(m, 'faint_')
-        print(f"{name:<16}{SEP}{_fmt7(m.get('bright_ap'))}"
-              f"{SEP}{_fmt7(bright_iou.get(75))}{SEP}{_fmt7(bright_iou.get(90))}"
-              f"{SEP}{_fmt7(m.get('faint_ap'))}"
-              f"{SEP}{_fmt7(faint_iou.get(75))}{SEP}{_fmt7(faint_iou.get(90))}")
+    print("\nInput-contrast-SNR-stratified recall "
+          "(local peak/MAD; score >= --score_thr; Hungarian mask IoU >= 0.50):")
+    print("-" * 60)
+    print(f"{'Model':<16}{SEP}{'SNR':>7}{SEP}{'GT':>6}{SEP}{'TP':>6}"
+          f"{SEP}{'FN':>6}{SEP}{'Recall':>7}")
+    print("-" * 60)
+    for label, _, _ in SNR_BINS:
+        for name, m in results.items():
+            group = m.get('snr_metrics', {}).get(label, {})
+            count = group.get('count')
+            count_text = f"{count:>6d}" if isinstance(count, int) else f"{'N/A':>6}"
+            def _count_text(key):
+                value = group.get(key)
+                return f"{value:>6d}" if isinstance(value, int) else f"{'N/A':>6}"
+            print(f"{name:<16}{SEP}{label:>7}{SEP}{count_text}"
+                  f"{SEP}{_count_text('tp')}{SEP}{_count_text('fn')}"
+                  f"{SEP}{_fmt7(group.get('recall'))}")
+        print("-" * 60)
+    missing = ', '.join(
+        f"{name}={m.get('snr_missing', 'N/A')}" for name, m in results.items())
+    print(f"GT without SNR (excluded from SNR groups): {missing}")
 
     print("\nMorphology split (from image.mode, not training classes):")
     print("-" * (16 + 8 * 7))
@@ -1215,7 +1349,7 @@ def print_stage_table(model_name, stage_results):
 #    
 #                                                                                              
 def main():
-    parser = argparse.ArgumentParser(description='Instance segmentation evaluation: AP, F1, cMSE, and binary-star metrics.')
+    parser = argparse.ArgumentParser(description='Instance segmentation evaluation: AP, F1, SNR groups, cMSE, and binary-star metrics.')
     parser.description = 'Evaluate MAINet instance segmentation checkpoints.'
     parser.epilog = CLI_USAGE
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
@@ -1274,6 +1408,12 @@ def main():
         'annotation_sha256': annotation_hash,
         'score_thr': float(args.score_thr),
         'f1_iou_thr': F1_IOU_THRESHOLD,
+        'snr_bins': [[label, lower, None if np.isinf(upper) else upper]
+                     for label, lower, upper in SNR_BINS],
+        'snr_definition': SNR_DEFINITION,
+        'snr_local_padding': SNR_LOCAL_PADDING,
+        'snr_matching': 'hungarian_mask_iou_0.50',
+        'centroid_mse_reference': 'gt_mask_centroid',
     }
 
     # Cached metrics are valid only for the same evaluator semantics and GT.
