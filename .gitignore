@@ -1,0 +1,40 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 数据集
+output/
+output_mix/
+mixed_point_streak_trainable/
+
+# 训练结果与权重
+work_dirs/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# 大型数组数据
+*.npy
+*.npz
+
+# 日志和系统文件
+*.log
+Thumbs.db
+.DS_Store
+
+/output*/
+/*_trainable*/
+
+/condinst/
+/mask2former/
+/mask_rcnn/
+/solov2/
+
+/.claude/
